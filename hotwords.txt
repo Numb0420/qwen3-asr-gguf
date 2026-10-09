@@ -1,0 +1,49 @@
+# ==========================================
+# 热词纠错文件 (hotwords.txt)
+# ==========================================
+# 使用音素 RAG 匹配，支持中英文混合。
+# 具备强制性：相似度高于阈值的一定会被替换。
+# 井号开头的行为注释，会被忽略。
+# 每行一个热词，可以用 | 分割添加多个别名。
+# 可以在热词与别名后，使用 ~~~ 分开添加"黑名单"防误杀词汇（也用 | 分隔）。
+# 示例：傅平 ~~~ 工作 | 精准 | 脱贫
+#   （当拟替换区间左右邻近一定语义词数内出现黑名单词语时，拦截不替换）
+#
+# 阈值由 .env 中 HOTWORD_THRESHOLD 控制（默认 0.85，越高越严格）。
+# 关闭纠错可设 HOTWORD_ENABLED=false。
+
+
+# ====== 纠正示例 ======
+CapsWriter | Caps Rider | Caps Right
+Qwen3-ASR | 千问ASR | 千问3ASR
+Qwen3-ASR-1.7B | 千问ASR1.7B | 千问3ASR1.7B
+Qwen3-TTS | 千问TTS | 千问3TTS
+Claude | 克劳德 | 克劳得
+Claude Code | cloud cold | cloud code
+Llama.cpp | 拉马点 CPP
+
+# ====== 黑名单示例 ======
+傅平 ~~~ 工作 | 精准 | 脱贫
+季伟 ~~~ 县纪委 | 市纪委
+
+# ====== 专业术语 ======
+CUDA | 酷的 | kuda
+PyTorch
+TensorRT
+DirectML
+TensorFlow
+Transformer
+ONNX | 昂克斯
+Vulkan | 武尔坎
+DirectML
+FP32
+FP16
+INT8
+INT4
+
+# ====== 文件后缀名 ======
+.md | 点MD | ，点MD
+.py | 点PY | ，点PY
+
+OpenClaw
+Agent

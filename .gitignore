@@ -1,0 +1,67 @@
+# Local configuration (keep the shareable template)
+.env
+.env.*
+!.env.example
+
+# -----------------
+# Models & binaries (large / redistributable separately)
+# -----------------
+models/
+*.gguf
+*.onnx
+*.safetensors
+*.pt
+*.pth
+*.engine
+vendor/qwen_asr_gguf/inference/bin/*.dll
+vendor/qwen_asr_gguf/inference/bin-*/
+
+# -----------------
+# Runtime outputs
+# -----------------
+outputs/
+logs/
+dist/
+build/
+*.log
+build.log
+
+# Audio / subtitle artifacts
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.srt
+*.vtt
+test.txt
+
+# -----------------
+# Python
+# -----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# -----------------
+# IDE / OS / local tooling
+# -----------------
+.idea/
+.vscode/
+.cursor/
+.claude/
+.worktrees/
+.DS_Store
+Thumbs.db
+Desktop.ini
