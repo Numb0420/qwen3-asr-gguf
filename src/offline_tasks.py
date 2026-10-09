@@ -6,7 +6,7 @@ import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Awaitable
@@ -39,7 +39,7 @@ from offline_split import SplitConfig, plan_chunks, stitch_chunk_text
 from offline_stitch import append_offline_chunk, finalize_offline_chunk
 from hotword_correct import apply_hotword
 from itn import apply_chinese_itn
-from segments import words_to_segments
+from segments import has_transcript_content, words_to_segments
 from vad import scan_silences
 
 InferFn = Callable[..., Awaitable]
@@ -57,7 +57,7 @@ def _new_task_id() -> str:
 def _decode_audio_file(path: Path) -> tuple[np.ndarray, int]:
     import soundfile as sf
 
-    audio, sr = sf.read(str(path))
+    audio, sr = sf.read(str(path), dtype="float32")
     if getattr(audio, "ndim", 1) > 1:
         audio = audio.mean(axis=1)
     audio = np.asarray(audio, dtype=np.float32)
@@ -172,11 +172,15 @@ def _dedup_rescue_overlap(
     if items:
         kept = [w for w in items if float(w.start) >= overlap_end - _RESCUE_DEDUP_TOL]
         text = "".join(w.word for w in kept)
+        if not has_transcript_content(text):
+            return "", []
         return text, kept
     # No word timestamps: text-based fallback
     from ws_overlap import strip_boundary
 
     text = strip_boundary(prev_text, rescue_text, acoustic_overlap=True)
+    if not has_transcript_content(text):
+        return "", []
     return text, []
 
 
@@ -246,6 +250,18 @@ class OfflineTaskStore:
         chunk_size: float,
     ):
         self._raise_if_cancelled(task)
+        try:
+            return await self._wait_infer(task, audio, sr, language, chunk_size)
+        except asyncio.TimeoutError:
+            # wait_for cancels the waiter, not the inference thread.
+            task.cancel_event.set()
+            await infer_queue.abort_session(task.task_id)
+            raise
+
+    async def _wait_infer(
+        self, task: OfflineTask, audio: np.ndarray, sr: int,
+        language: str | None, chunk_size: float,
+    ):
         result = await asyncio.wait_for(
             self._infer(
                 audio,
@@ -294,8 +310,11 @@ class OfflineTaskStore:
         sr: int,
         language: str | None,
         max_half: float = 20.0,
+        *,
+        silences: list[tuple[float, float]] | None = None,
+        audio_start: float = 0.0,
     ) -> tuple[str, list[WordTimestamp] | None]:
-        """Split audio into ~max_half halves, infer each, merge text+words.
+        """Rescue with shorter silence-first chunks and overlap at hard cuts.
 
         Used as a second-level rescue when a full chunk returns empty.
         Changing the encoder's input (shorter segment) is more effective
@@ -310,32 +329,43 @@ class OfflineTaskStore:
             words = getattr(result, "words", None)
             return text, words
 
-        mid = len(audio) // 2
-        halves = [
-            (audio[:mid], 0.0),
-            (audio[mid:], mid / float(sr)),
+        local_silences = [
+            (max(0.0, start - audio_start), min(total_dur, end - audio_start))
+            for start, end in (silences or [])
+            if end > audio_start and start < audio_start + total_dur
         ]
+        cfg = replace(
+            _offline_split_config(),
+            target=max_half * 0.75,
+            search=max_half * 0.25,
+            max_chunk=max_half,
+        )
+        plans = plan_chunks(total_dur, local_silences, cfg)
         texts: list[str] = []
         all_words: list[WordTimestamp] = []
-        for half_audio, offset in halves:
+        missing_words = False
+        for plan in plans:
+            half_audio = _slice_audio(audio, sr, plan.audio_start, plan.audio_end)
             half_dur = len(half_audio) / float(sr)
             half_size = max(FILE_CHUNK_SIZE_SEC, half_dur)
             result = await self._call_infer(task, half_audio, sr, language, half_size)
             text = getattr(result, "text", "") or ""
             words = getattr(result, "words", None)
+            text, words = finalize_offline_chunk(
+                text, words,
+                audio_start=plan.audio_start, audio_end=plan.audio_end,
+                drop_before=plan.drop_before, kind=plan.kind,
+                prev_text=texts[-1] if texts else "", prev_words=all_words,
+                eps=cfg.cut_eps, overlap=cfg.hard_overlap,
+            )
             if text:
                 texts.append(text)
                 if words:
-                    all_words.extend(
-                        WordTimestamp(
-                            word=w.word,
-                            start=round(float(w.start) + offset, 3),
-                            end=round(float(w.end) + offset, 3),
-                        )
-                        for w in words
-                    )
+                    all_words = append_offline_chunk(all_words, words)
+                else:
+                    missing_words = True
         merged = "".join(texts)
-        return merged, (all_words if all_words else None)
+        return merged, (all_words if all_words and not missing_words else None)
 
     def has_active(self) -> bool:
         return any(t.status == "running" for t in self._tasks.values())
@@ -496,9 +526,10 @@ class OfflineTaskStore:
                                     "retry still empty, trying split rescue",
                                     task.task_id, i + 1, guard_status,
                                 )
-                                # Level-2 rescue: split chunk into ~20s halves
+                                # Level-2 rescue: shorter silence-first chunks.
                                 split_text, split_words = await self._infer_split(
-                                    task, chunk, sr, task.language
+                                    task, chunk, sr, task.language,
+                                    silences=silences, audio_start=plan.audio_start,
                                 )
                                 if split_text:
                                     raw_text = split_text
@@ -522,10 +553,9 @@ class OfflineTaskStore:
                         else:
                             guard_status = "EMPTY_OK"
 
-                    # Tail rescue: check for premature EOS after any non-empty result
-                    # (including retry-rescued text). Recompute last_char_end from
-                    # current result_words since retry may have replaced them.
-                    if raw_text:
+                    # Tail coverage requires alignment timestamps. Without them,
+                    # treating the chunk start as the last word would retry all audio.
+                    if raw_text and result_words:
                         last_char_end = plan.audio_start
                         if result_words:
                             shifted_ends = [
@@ -560,6 +590,7 @@ class OfflineTaskStore:
                             rescue_words = getattr(rescue_result, "words", None)
                             if rescue_text:
                                 guard_status = "RESCUED_TAIL"
+                                rescue_raw_len = len(rescue_text)
                                 word_offset = rescue_start - plan.audio_start
                                 shifted_rescue_words = [
                                     WordTimestamp(
@@ -571,15 +602,15 @@ class OfflineTaskStore:
                                 ]
                                 rescue_text, kept_words = _dedup_rescue_overlap(
                                     raw_text, rescue_text, shifted_rescue_words,
-                                    last_char_end,
+                                    last_char_end - plan.audio_start,
                                 )
                                 log.info(
                                     "Offline coverage_guard | task={} chunk={} status={} "
                                     "rescue_range={:.3f}-{:.3f} rescue_raw_len={} "
-                                    "dedup_kept={}",
+                                    "dedup_kept={} dedup_text_len={}",
                                     task.task_id, i + 1, guard_status,
-                                    rescue_start, rescue_end, len(rescue_text),
-                                    len(kept_words),
+                                    rescue_start, rescue_end, rescue_raw_len,
+                                    len(kept_words), len(rescue_text),
                                 )
                                 if rescue_text:
                                     raw_text = raw_text + rescue_text
@@ -588,19 +619,21 @@ class OfflineTaskStore:
                                     elif kept_words:
                                         result_words = list(kept_words)
                                 else:
-                                    guard_status = "RESCUED_TAIL_OVERLAP_ONLY"
+                                    guard_status = "TAIL_RESCUE_NO_NEW_TEXT"
                                     log.info(
                                         "Offline coverage_guard | task={} chunk={} "
-                                        "status={} action=rescue_fully_overlapped",
+                                        "status={} action=no_new_body_after_dedup",
                                         task.task_id, i + 1, guard_status,
                                     )
                             else:
-                                # Level-2 rescue: split tail into ~20s halves
+                                # Level-2 rescue: shorter silence-first chunks.
                                 split_text, split_words = await self._infer_split(
-                                    task, rescue_chunk, sr, task.language
+                                    task, rescue_chunk, sr, task.language,
+                                    silences=silences, audio_start=rescue_start,
                                 )
                                 if split_text:
                                     guard_status = "RESCUED_TAIL_SPLIT"
+                                    split_raw_len = len(split_text)
                                     word_offset = rescue_start - plan.audio_start
                                     shifted_split_words = [
                                         WordTimestamp(
@@ -612,15 +645,15 @@ class OfflineTaskStore:
                                     ]
                                     split_text, kept_words = _dedup_rescue_overlap(
                                         raw_text, split_text, shifted_split_words,
-                                        last_char_end,
+                                        last_char_end - plan.audio_start,
                                     )
                                     log.info(
                                         "Offline coverage_guard | task={} chunk={} status={} "
                                         "split_rescue_range={:.3f}-{:.3f} split_raw_len={} "
-                                        "dedup_kept={}",
+                                        "dedup_kept={} dedup_text_len={}",
                                         task.task_id, i + 1, guard_status,
-                                        rescue_start, rescue_end, len(split_text),
-                                        len(kept_words),
+                                        rescue_start, rescue_end, split_raw_len,
+                                        len(kept_words), len(split_text),
                                     )
                                     if split_text:
                                         raw_text = raw_text + split_text
@@ -629,10 +662,10 @@ class OfflineTaskStore:
                                         elif kept_words:
                                             result_words = list(kept_words)
                                     else:
-                                        guard_status = "RESCUED_TAIL_SPLIT_OVERLAP_ONLY"
+                                        guard_status = "TAIL_SPLIT_RESCUE_NO_NEW_TEXT"
                                         log.info(
                                             "Offline coverage_guard | task={} chunk={} "
-                                            "status={} action=split_rescue_fully_overlapped",
+                                            "status={} action=no_new_body_after_dedup",
                                             task.task_id, i + 1, guard_status,
                                         )
                                 else:
@@ -654,8 +687,8 @@ class OfflineTaskStore:
                         and tail_pre_stats is not None
                         and guard_status in (
                             "TAIL_VAD_FALSE_POSITIVE",
-                            "RESCUED_TAIL_OVERLAP_ONLY",
-                            "RESCUED_TAIL_SPLIT_OVERLAP_ONLY",
+                            "TAIL_RESCUE_NO_NEW_TEXT",
+                            "TAIL_SPLIT_RESCUE_NO_NEW_TEXT",
                         )
                         and tail_pre_stats["speech"] < _TAIL_HALLUCINATION_SPEECH_SEC
                         and len((raw_text or "").strip()) <= _TAIL_HALLUCINATION_MAX_TEXT_LEN
@@ -766,7 +799,7 @@ class OfflineTaskStore:
             self._mark_cancelled(task)
             log.info("Offline task {} cancelled", task.task_id)
         except asyncio.TimeoutError:
-            if task.cancel_event.is_set() or task.status == "cancelled":
+            if task.status == "cancelled":
                 self._mark_cancelled(task)
                 log.info("Offline task {} cancelled (during timeout path)", task.task_id)
                 return

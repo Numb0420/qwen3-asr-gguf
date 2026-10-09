@@ -16,8 +16,6 @@ from ws_overlap import (
     strip_boundary,
     strip_forced_cut_stop,
     sync_words_to_text,
-    trim_cut_fragment,
-    trim_dangling_tail,
 )
 
 _LEADING_SHORT = re.compile(r"^([\u4e00-\u9fff]{1,2})([。！？!?；;])")
@@ -158,9 +156,8 @@ def finalize_offline_chunk(
     text = _join_words(kept) if kept else raw
     if kind == "hard":
         text = strip_forced_cut_stop(text)
-        text = trim_dangling_tail(text)
-    else:
-        text = trim_cut_fragment(text)
+    # Short replies (对 / 好 / 是) are valid speech. Length and punctuation
+    # alone cannot prove that they are cut fragments, even at a hard cut.
     if kept and text != _join_words(kept):
         kept = sync_words_to_text(kept, text)
 
@@ -174,7 +171,6 @@ def finalize_offline_chunk(
             text = stitched
         if not text:
             return "", []
-        text, kept = drop_leading_short_sentence(prev_words, kept, text)
         if leftover_echo(prev_text, text):
             return "", []
 

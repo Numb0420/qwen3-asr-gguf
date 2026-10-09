@@ -293,9 +293,20 @@ def test_offline_leading_short_after_gap() -> None:
         prev_text=prev,
         prev_words=_words(prev, 237.0),
     )
-    _assert(text.startswith("3分钟"), text)
-    _assert("新晋" not in text, text)
-    _assert("".join(w.word for w in kept).startswith("3分钟"), kept)
+    _assert(text.startswith("新晋。3分钟"), text)
+    _assert("".join(w.word for w in kept).startswith("新晋。3分钟"), kept)
+
+
+def test_offline_preserves_short_replies() -> None:
+    for kind in ("silence", "tail", "hard"):
+        for reply in ("对", "好", "是", "行", "对对"):
+            raw = "这个问题解决了。" + reply + "。"
+            text, kept = finalize_offline_chunk(
+                raw, _words(raw, 10.0), audio_start=0.0,
+                audio_end=40.0, drop_before=None, kind=kind,
+            )
+            _assert(text.rstrip("。").endswith(reply), text)
+            _assert("".join(w.word for w in kept).rstrip("。").endswith(reply), kept)
 
 
 def test_offline_keep_real_sentences() -> None:
@@ -426,6 +437,7 @@ def main() -> int:
         test_offline_collapsed_这项新规,
         test_offline_intra_chunk_collapsed_tail,
         test_offline_leading_short_after_gap,
+        test_offline_preserves_short_replies,
         test_offline_keep_real_sentences,
         test_offline_de_after_false_period,
         test_offline_leftover_echo_skipped,

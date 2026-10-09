@@ -13,7 +13,12 @@ def _is_punct_token(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return True
-    return all(ch in _PUNCT or unicodedata.category(ch).startswith("P") for ch in raw)
+    return all(ch.isspace() or ch in _PUNCT or unicodedata.category(ch).startswith("P") for ch in raw)
+
+
+def has_transcript_content(text: str) -> bool:
+    """Whether text contains anything besides whitespace and punctuation."""
+    return not _is_punct_token(text)
 
 
 def _split_trailing_punct(token: str) -> tuple[str, str]:
@@ -54,7 +59,7 @@ def words_to_segments(words: list[WordTimestamp] | None, fallback_text: str = ""
     items = list(words or [])
     if not items:
         text = (fallback_text or "").strip()
-        if not text:
+        if not has_transcript_content(text):
             return []
         return [_flush(text, [], 1)]
 
@@ -65,7 +70,8 @@ def words_to_segments(words: list[WordTimestamp] | None, fallback_text: str = ""
 
     def _commit() -> None:
         nonlocal buf_text, chars, index
-        if buf_text.strip() or chars:
+        # Repeated sentence-end tokens must not create a timestamp-less segment.
+        if has_transcript_content(buf_text):
             segments.append(_flush(buf_text, chars, index))
             index += 1
         buf_text = ""

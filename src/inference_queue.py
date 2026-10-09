@@ -96,6 +96,13 @@ class PriorityInferQueue:
                         self._idle.set()
                     continue
                 job = heapq.heappop(self._heap)
+                if job.future.cancelled() or job.abort_event.is_set():
+                    if not job.future.done():
+                        job.future.set_exception(InferAborted("job aborted before execution"))
+                    if not self._heap:
+                        self._has_work.clear()
+                        self._idle.set()
+                    continue
                 self._running += 1
                 self._idle.clear()
             with self._running_lock:
@@ -219,9 +226,10 @@ class PriorityInferQueue:
                     n += 1
             kept: list[_InferJob] = []
             for job in self._heap:
-                if job.session_id == session_id and not job.future.done():
+                if job.session_id == session_id:
                     job.abort_event.set()
-                    job.future.set_exception(InferAborted(f"session {session_id} aborted"))
+                    if not job.future.done():
+                        job.future.set_exception(InferAborted(f"session {session_id} aborted"))
                     n += 1
                     continue
                 kept.append(job)
