@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from typing import Callable, Awaitable
 
 import numpy as np
 from scipy.signal import resample_poly
+
+from inference_queue import InferAborted, infer_queue
 
 from config import (
     ASR_REMOVE_FILLERS,
@@ -40,6 +43,10 @@ from segments import words_to_segments
 from vad import scan_silences
 
 InferFn = Callable[..., Awaitable]
+
+
+class OfflineCancelled(Exception):
+    """Offline task was cancelled by the client."""
 
 
 def _new_task_id() -> str:
@@ -189,6 +196,7 @@ class OfflineTask:
     finished_at: float | None = None
     files: dict = field(default_factory=dict)
     result: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_status(self) -> dict:
         out = {
@@ -224,8 +232,64 @@ class OfflineTaskStore:
     def bind_infer(self, fn: InferFn) -> None:
         self._infer = fn
 
+    @staticmethod
+    def _raise_if_cancelled(task: OfflineTask) -> None:
+        if task.cancel_event.is_set() or task.status == "cancelled":
+            raise OfflineCancelled(task.task_id)
+
+    async def _call_infer(
+        self,
+        task: OfflineTask,
+        audio: np.ndarray,
+        sr: int,
+        language: str | None,
+        chunk_size: float,
+    ):
+        self._raise_if_cancelled(task)
+        result = await asyncio.wait_for(
+            self._infer(
+                audio,
+                sr,
+                language,
+                "",
+                chunk_size,
+                abort_event=task.cancel_event,
+                session_id=task.task_id,
+            ),
+            timeout=REQUEST_TIMEOUT,
+        )
+        self._raise_if_cancelled(task)
+        return result
+
+    def _mark_cancelled(self, task: OfflineTask) -> None:
+        task.status = "cancelled"
+        task.message = "cancelled"
+        if task.finished_at is None:
+            task.finished_at = time.time()
+
+    async def cancel(self, task_id: str) -> OfflineTask | None:
+        """Request cancel. Idempotent for already-finished tasks."""
+        task = self.get(task_id)
+        if task is None:
+            return None
+        if task.status in ("completed", "failed", "cancelled"):
+            return task
+        task.cancel_event.set()
+        aborted = await infer_queue.abort_session(task.task_id)
+        # Task may have finished while we were aborting the queue.
+        if task.status in ("completed", "failed"):
+            return task
+        self._mark_cancelled(task)
+        log.info(
+            "Offline task {} cancel requested | aborted_jobs={}",
+            task.task_id,
+            aborted,
+        )
+        return task
+
     async def _infer_split(
         self,
+        task: OfflineTask,
         audio: np.ndarray,
         sr: int,
         language: str | None,
@@ -241,10 +305,7 @@ class OfflineTaskStore:
         if total_dur <= max_half * 1.5:
             # Already short enough — single inference
             chunk_size = max(FILE_CHUNK_SIZE_SEC, total_dur)
-            result = await asyncio.wait_for(
-                self._infer(audio, sr, language, "", chunk_size),
-                timeout=REQUEST_TIMEOUT,
-            )
+            result = await self._call_infer(task, audio, sr, language, chunk_size)
             text = getattr(result, "text", "") or ""
             words = getattr(result, "words", None)
             return text, words
@@ -259,10 +320,7 @@ class OfflineTaskStore:
         for half_audio, offset in halves:
             half_dur = len(half_audio) / float(sr)
             half_size = max(FILE_CHUNK_SIZE_SEC, half_dur)
-            result = await asyncio.wait_for(
-                self._infer(half_audio, sr, language, "", half_size),
-                timeout=REQUEST_TIMEOUT,
-            )
+            result = await self._call_infer(task, half_audio, sr, language, half_size)
             text = getattr(result, "text", "") or ""
             words = getattr(result, "words", None)
             if text:
@@ -324,10 +382,12 @@ class OfflineTaskStore:
             task.finished_at = time.time()
             return
         try:
+            self._raise_if_cancelled(task)
             loop = asyncio.get_event_loop()
             audio, sr = await loop.run_in_executor(
                 None, _decode_audio_file, task.audio_path
             )
+            self._raise_if_cancelled(task)
             duration = float(audio.size) / float(sr) if audio.size else 0.0
             cfg = _offline_split_config()
             try:
@@ -337,6 +397,7 @@ class OfflineTaskStore:
             except Exception as e:
                 log.error("Offline VAD scan failed, falling back to hard cuts: {}", e)
                 silences = []
+            self._raise_if_cancelled(task)
             plans = plan_chunks(duration, silences, cfg)
             if not plans:
                 task.total_windows = 1
@@ -349,6 +410,7 @@ class OfflineTaskStore:
                 texts: list[str] = []
                 prev_text = ""
                 for i, plan in enumerate(plans):
+                    self._raise_if_cancelled(task)
                     log.info(
                         "Offline task {} chunk {}/{} kind={} audio={:.3f}-{:.3f} drop_before={}",
                         task.task_id,
@@ -388,9 +450,8 @@ class OfflineTaskStore:
                             task.message = f"{task.progress_percent:.2f}%"
                             continue
 
-                    result = await asyncio.wait_for(
-                        self._infer(chunk, sr, task.language, "", chunk_size),
-                        timeout=REQUEST_TIMEOUT,
+                    result = await self._call_infer(
+                        task, chunk, sr, task.language, chunk_size
                     )
                     raw_text = getattr(result, "text", "") or ""
                     n_gen = getattr(result, "n_generate", 0) or 0
@@ -414,9 +475,8 @@ class OfflineTaskStore:
                                 chunk_stats["speech"], chunk_stats["speech_ratio"],
                             )
                             # Retry: same temp, new seed (sampler auto-randomizes)
-                            retry_result = await asyncio.wait_for(
-                                self._infer(chunk, sr, task.language, "", chunk_size),
-                                timeout=REQUEST_TIMEOUT,
+                            retry_result = await self._call_infer(
+                                task, chunk, sr, task.language, chunk_size
                             )
                             raw_text = getattr(retry_result, "text", "") or ""
                             n_gen = getattr(retry_result, "n_generate", 0) or 0
@@ -438,7 +498,7 @@ class OfflineTaskStore:
                                 )
                                 # Level-2 rescue: split chunk into ~20s halves
                                 split_text, split_words = await self._infer_split(
-                                    chunk, sr, task.language
+                                    task, chunk, sr, task.language
                                 )
                                 if split_text:
                                     raw_text = split_text
@@ -493,11 +553,8 @@ class OfflineTaskStore:
                             rescue_chunk = _slice_audio(audio, sr, rescue_start, rescue_end)
                             rescue_dur = max(0.0, rescue_end - rescue_start)
                             rescue_size = max(FILE_CHUNK_SIZE_SEC, rescue_dur)
-                            rescue_result = await asyncio.wait_for(
-                                self._infer(
-                                    rescue_chunk, sr, task.language, "", rescue_size
-                                ),
-                                timeout=REQUEST_TIMEOUT,
+                            rescue_result = await self._call_infer(
+                                task, rescue_chunk, sr, task.language, rescue_size
                             )
                             rescue_text = getattr(rescue_result, "text", "") or ""
                             rescue_words = getattr(rescue_result, "words", None)
@@ -540,7 +597,7 @@ class OfflineTaskStore:
                             else:
                                 # Level-2 rescue: split tail into ~20s halves
                                 split_text, split_words = await self._infer_split(
-                                    rescue_chunk, sr, task.language
+                                    task, rescue_chunk, sr, task.language
                                 )
                                 if split_text:
                                     guard_status = "RESCUED_TAIL_SPLIT"
@@ -681,6 +738,10 @@ class OfflineTaskStore:
                     segments = cleaned_segments
                 payload = {"segments": segments}
 
+            if task.cancel_event.is_set() or task.status == "cancelled":
+                self._mark_cancelled(task)
+                log.info("Offline task {} cancelled before complete", task.task_id)
+                return
             task.result = payload
             if OFFLINE_SAVE_RESULT:
                 out_dir = OUTPUT_DIR / task.task_id
@@ -692,17 +753,32 @@ class OfflineTaskStore:
                 log.info("Offline task {} completed | windows={} json={}", task.task_id, task.total_windows, json_path)
             else:
                 log.info("Offline task {} completed | windows={} (result not saved to disk)", task.task_id, task.total_windows)
+            if task.cancel_event.is_set() or task.status == "cancelled":
+                self._mark_cancelled(task)
+                log.info("Offline task {} cancelled before complete", task.task_id)
+                return
             task.completed_windows = task.total_windows
             task.progress_percent = 100.0
             task.message = "100.00%"
             task.status = "completed"
             task.finished_at = time.time()
+        except (OfflineCancelled, InferAborted):
+            self._mark_cancelled(task)
+            log.info("Offline task {} cancelled", task.task_id)
         except asyncio.TimeoutError:
+            if task.cancel_event.is_set() or task.status == "cancelled":
+                self._mark_cancelled(task)
+                log.info("Offline task {} cancelled (during timeout path)", task.task_id)
+                return
             task.status = "failed"
             task.message = "Transcription timed out"
             task.finished_at = time.time()
             log.error("Offline task {} timed out", task.task_id)
         except Exception as e:
+            if task.cancel_event.is_set() or task.status == "cancelled":
+                self._mark_cancelled(task)
+                log.info("Offline task {} cancelled (during error path): {}", task.task_id, e)
+                return
             task.status = "failed"
             task.message = str(e)
             task.finished_at = time.time()

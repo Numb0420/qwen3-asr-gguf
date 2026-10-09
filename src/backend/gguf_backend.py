@@ -290,6 +290,7 @@ class QwenGGUFBackend(ASRBackend):
         on_chunk=None,
         prefix_text: str = "",
         chunk_size_sec: float | None = None,
+        abort_event: "threading.Event | None" = None,
     ) -> ASRResult:
         size = FILE_CHUNK_SIZE_SEC if chunk_size_sec is None else float(chunk_size_sec)
         return self._run(
@@ -302,6 +303,7 @@ class QwenGGUFBackend(ASRBackend):
             on_chunk=on_chunk,
             prefix_text=prefix_text,
             temperature=OFFLINE_ASR_TEMPERATURE,
+            abort_event=abort_event,
         )
 
     def advance_encoder(

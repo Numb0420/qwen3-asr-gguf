@@ -78,7 +78,14 @@ async def run() -> int:
         if hello.get("status") != "connected":
             return 1
 
-        await ws.send(json.dumps({"action": "config", "language": LANGUAGE, "use_server_vad": USE_VAD}))
+        await ws.send(json.dumps({
+            "type": "start",
+            "language": LANGUAGE,
+            "sample_rate": sr,
+            "channels": 1,
+            "format": "pcm_s16le",
+            "use_server_vad": USE_VAD,
+        }))
         print(f"configured: {json.loads(await ws.recv())}")
 
         got_final = asyncio.Event()
@@ -131,14 +138,14 @@ async def run() -> int:
 
                 # flush after each loop
                 got_final.clear()
-                await ws.send(json.dumps({"action": "flush"}))
+                await ws.send(json.dumps({"type": "flush"}))
                 try:
                     await asyncio.wait_for(got_final.wait(), timeout=30.0)
                 except asyncio.TimeoutError:
                     print(f"[{time.monotonic()-start_time:.0f}s] timeout waiting for flush final")
 
                 # reset for next loop (clears KV cache to simulate new utterance)
-                await ws.send(json.dumps({"action": "reset"}))
+                await ws.send(json.dumps({"type": "reset"}))
 
         finally:
             reader_task.cancel()

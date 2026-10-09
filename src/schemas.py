@@ -66,7 +66,7 @@ class TaskResultResponse(BaseModel):
 class TaskStatusResponse(BaseModel):
     task_id: str
     filename: str
-    status: str
+    status: str = Field(..., description="running / completed / failed / cancelled")
     message: str
     progress_percent: float
     completed_windows: int

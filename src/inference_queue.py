@@ -10,6 +10,11 @@ from typing import Any, Callable, Literal
 
 JobKind = Literal["normal", "partial", "final"]
 
+
+class InferAborted(Exception):
+    """Job was cancelled via abort_session (offline cancel / drop pending)."""
+
+
 _infer_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="qwen3-asr-infer",
@@ -196,6 +201,36 @@ class PriorityInferQueue:
 
     def remove_idle_callback(self, cb) -> None:
         self._idle_callbacks = [item for item in self._idle_callbacks if item is not cb]
+
+    async def abort_session(self, session_id: str) -> int:
+        """Abort running job + drop pending jobs for session_id. Returns affected count."""
+        if not session_id:
+            return 0
+        n = 0
+        async with self._lock:
+            with self._running_lock:
+                running = self._running_job
+                if (
+                    running is not None
+                    and running.session_id == session_id
+                    and not running.abort_event.is_set()
+                ):
+                    running.abort_event.set()
+                    n += 1
+            kept: list[_InferJob] = []
+            for job in self._heap:
+                if job.session_id == session_id and not job.future.done():
+                    job.abort_event.set()
+                    job.future.set_exception(InferAborted(f"session {session_id} aborted"))
+                    n += 1
+                    continue
+                kept.append(job)
+            self._heap = kept
+            heapq.heapify(self._heap)
+            if self._running == 0 and not self._heap:
+                self._idle.set()
+                self._has_work.clear()
+        return n
 
 
 infer_queue = PriorityInferQueue()

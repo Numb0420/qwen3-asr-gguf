@@ -119,7 +119,14 @@ async def replay(
         hello = json.loads(await ws.recv())
         if hello.get("status") != "connected":
             raise RuntimeError(f"WebSocket connection failed: {hello}")
-        await ws.send(json.dumps({"action": "config", "language": "auto", "use_server_vad": True}))
+        await ws.send(json.dumps({
+            "type": "start",
+            "language": "auto",
+            "sample_rate": sample_rate,
+            "channels": 1,
+            "format": "pcm_s16le",
+            "use_server_vad": True,
+        }))
         configured = json.loads(await ws.recv())
         if configured.get("status") != "configured":
             raise RuntimeError(f"WebSocket configuration failed: {configured}")
@@ -155,7 +162,7 @@ async def replay(
                 packet = pcm[offset : offset + chunk_bytes]
                 await ws.send(packet)
                 sent_audio_s = (offset + len(packet)) / (sample_rate * 2.0)
-            await ws.send(json.dumps({"action": "stop"}))
+            await ws.send(json.dumps({"type": "stop"}))
             await asyncio.wait_for(reader_task, timeout=180.0)
 
     (case_dir / "final.txt").write_text("".join(finals), encoding="utf-8")

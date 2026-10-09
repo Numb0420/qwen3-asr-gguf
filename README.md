@@ -24,10 +24,10 @@ Wraps Qwen3-ASR-1.7B in a production-ready FastAPI server with real-time WebSock
 ### Real-Time WebSocket
 - **Sliding window** — re-transcribes up to 6s of accumulated audio each trigger for full context
 - **Server-side VAD** — Silero Voice Activity Detection auto-flushes on speech→silence transitions; skips inference for silence (`ASR_USE_SERVER_VAD=true` by default)
-- **Per-connection VAD toggle** — clients can disable VAD via query param (`?use_server_vad=false`) or mid-session config action
+- **Per-connection VAD toggle** — clients can disable VAD via query param (`?use_server_vad=false`) or mid-session `type:config` / `type:start`
 - **Silence padding** — 600ms silence appended on flush to commit trailing words
 - **Dual-model partials** — optionally use 0.6B for fast partials, 1.7B for final (`DUAL_MODEL=true`)
-- **Control commands** — `flush`, `reset`, `config` (set language, toggle VAD)
+- **Control commands** — JSON `type`: `start` (language, sample_rate, VAD), `end`/`flush`, `reset`, `config`, `stop`
 
 ### Performance
 - **Priority scheduling** — WebSocket requests (priority 0) preempt HTTP uploads (priority 1) via min-heap queue

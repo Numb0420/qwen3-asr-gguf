@@ -40,6 +40,7 @@ class ASRBackend:
         on_chunk=None,
         prefix_text: str = "",
         chunk_size_sec: float | None = None,
+        abort_event: "threading.Event | None" = None,
     ) -> ASRResult:
         raise NotImplementedError
 

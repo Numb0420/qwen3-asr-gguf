@@ -294,7 +294,16 @@ async def lifespan(_app):
     apply_llm_device_env()
     validate_env()
     infer_queue.start()
-    async def _offline_infer(audio, sr, language, prefix_text="", chunk_size_sec=None):
+    async def _offline_infer(
+        audio,
+        sr,
+        language,
+        prefix_text="",
+        chunk_size_sec=None,
+        *,
+        abort_event=None,
+        session_id="",
+    ):
         await _ensure_model_loaded()
         _touch()
 
@@ -305,9 +314,16 @@ async def lifespan(_app):
                 language,
                 prefix_text=prefix_text,
                 chunk_size_sec=chunk_size_sec,
+                abort_event=abort_event,
             )
 
-        result = await infer_queue.submit(_job, priority=1, kind="normal")
+        result = await infer_queue.submit(
+            _job,
+            priority=1,
+            kind="normal",
+            session_id=session_id or "",
+            abort_event=abort_event,
+        )
         if result is None:
             raise RuntimeError("Inference result was dropped")
         result.text = detect_and_fix_repetitions(result.text)
@@ -457,6 +473,19 @@ async def get_task_result(task_id: str):
     if task.status != "completed" or task.result is None:
         return error_response("TASK_NOT_READY", task.message or task.status, 409)
     return task.result
+
+
+@app.post(
+    "/offline/tasks/{task_id}/cancel",
+    response_model=TaskStatusResponse,
+    tags=["Transcription"],
+    summary="Cancel a running offline task",
+)
+async def cancel_task(task_id: str):
+    task = await offline_store.cancel(task_id)
+    if task is None:
+        return error_response("TASK_NOT_FOUND", f"Unknown task_id: {task_id}", 404)
+    return task.to_status()
 
 
 @app.websocket("/realtime/stream")
@@ -1445,10 +1474,51 @@ async def websocket_transcribe(websocket: WebSocket):
                         "statusCode": 400,
                     })
                     continue
-                action = msg.get("action", "")
-                if action == "flush":
-                    await emit_asr(True, wait=True, reason="flush")
-                elif action == "reset":
+                msg_type = msg.get("type", "")
+
+                def _apply_language_from_msg() -> None:
+                    nonlocal lang_code
+                    new_lang = msg.get("language")
+                    if new_lang == "auto":
+                        lang_code = None
+                    elif new_lang:
+                        lang_code = new_lang
+
+                if msg_type == "start":
+                    _apply_language_from_msg()
+                    if "use_server_vad" in msg:
+                        use_vad = bool(msg["use_server_vad"])
+                    sr_in = msg.get("sample_rate")
+                    if sr_in is not None:
+                        try:
+                            sr_val = int(sr_in)
+                        except (TypeError, ValueError):
+                            sr_val = None
+                        if sr_val in (8000, 16000):
+                            client_sr = sr_val
+                        elif sr_val is not None:
+                            await _send({
+                                "code": "UNSUPPORTED_SAMPLE_RATE",
+                                "message": f"sample_rate must be 8000 or 16000, got {sr_val}",
+                                "statusCode": 400,
+                            })
+                            continue
+                    log.info(
+                        "WS start | language={} sample_rate={} use_vad={}",
+                        lang_code or "auto",
+                        client_sr,
+                        use_vad,
+                    )
+                    await _send({
+                        "status": "started",
+                        "language": lang_code or "auto",
+                        "sample_rate": client_sr,
+                        "format": "pcm_s16le",
+                        "use_server_vad": use_vad,
+                    })
+                elif msg_type in ("flush", "end"):
+                    await emit_asr(True, wait=True, reason="flush" if msg_type == "flush" else "end")
+                elif msg_type == "reset":
                     partial_gate.reset()
                     await _drain()
                     log.info(
@@ -1488,12 +1558,8 @@ async def websocket_transcribe(websocket: WebSocket):
                     commit_start = buffer_audio_start
                     drop_before = None
                     await _send({"status": "buffer_reset"})
-                elif action == "config":
-                    new_lang = msg.get("language")
-                    if new_lang == "auto":
-                        lang_code = None
-                    elif new_lang:
-                        lang_code = new_lang
+                elif msg_type == "config":
+                    _apply_language_from_msg()
                     if "use_server_vad" in msg:
                         use_vad = bool(msg["use_server_vad"])
                     await _send({
@@ -1501,7 +1567,7 @@ async def websocket_transcribe(websocket: WebSocket):
                         "language": lang_code or "auto",
                         "use_server_vad": use_vad,
                     })
-                elif action == "stop":
+                elif msg_type == "stop":
                     accept_pcm = False
                     if speech_buf.size > 0:
                         await emit_asr(True, wait=True, reason="stop")
@@ -1512,8 +1578,8 @@ async def websocket_transcribe(websocket: WebSocket):
                     break
                 else:
                     await _send({
-                        "code": "UNKNOWN_ACTION",
-                        "message": f"Unknown action: {action!r}",
+                        "code": "UNKNOWN_TYPE",
+                        "message": f"Unknown type: {msg_type!r}",
                         "statusCode": 400,
                     })
                 continue

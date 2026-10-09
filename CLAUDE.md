@@ -74,6 +74,7 @@ python E2Etest/test_websocket.py
 | `/offline/transcribe-path` | POST | Local `audio_path`, returns `task_id` |
 | `/offline/tasks/{id}` | GET | Offline task status |
 | `/offline/tasks/{id}/result` | GET | `{segments: [...]}` when completed |
+| `/offline/tasks/{id}/cancel` | POST | Cancel a running offline task (frees GPU for WebSocket) |
 | `/realtime/stream` | WebSocket | Real-time streaming with raw PCM input |
 
 ### Concurrency Model
@@ -105,7 +106,8 @@ python E2Etest/test_websocket.py
 - **Silence padding**: 600ms silence appended on `flush` command to commit trailing words (`WS_FLUSH_SILENCE_MS`)
 - **VAD gating**: Silero VAD skips inference for silent frames; auto-flushes on speech→silence transitions (`ASR_USE_SERVER_VAD=true` default, overridable per-connection via query param or config action)
 - **Dual-model**: If `DUAL_MODEL=true`, uses 0.6B for partials, 1.7B for final transcription
-- Control messages: `flush`, `reset`, `config` (set language, toggle `use_server_vad`)
+- Control messages use JSON field `type`: `start` (language / sample_rate / VAD), `end`/`flush`, `reset`, `config`, `stop`
+- `type:start` with `language` is mapped (`zh`→Chinese, `auto`→None) and passed into ASR decode
 - Buffer transcribed on disconnect (no audio loss)
 
 ### Audio Preprocessing & Chunking

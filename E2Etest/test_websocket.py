@@ -83,7 +83,14 @@ async def run() -> int:
         if hello.get("status") != "connected":
             return 1
 
-        await ws.send(json.dumps({"action": "config", "language": LANGUAGE, "use_server_vad": USE_VAD}))
+        await ws.send(json.dumps({
+            "type": "start",
+            "language": LANGUAGE,
+            "sample_rate": sr,
+            "channels": 1,
+            "format": "pcm_s16le",
+            "use_server_vad": USE_VAD,
+        }))
         print("configured:", json.loads(await ws.recv()))
 
         finals: list[str] = []
@@ -113,7 +120,7 @@ async def run() -> int:
                 if REALTIME:
                     await asyncio.sleep(CHUNK_MS / 1000.0)
             got_final.clear()
-            await ws.send(json.dumps({"action": "flush"}))
+            await ws.send(json.dumps({"type": "flush"}))
             await asyncio.wait_for(got_final.wait(), timeout=120.0)
         except asyncio.TimeoutError:
             print("timeout waiting for flush final", file=sys.stderr)
