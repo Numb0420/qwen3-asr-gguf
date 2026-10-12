@@ -40,7 +40,7 @@ def silence_threshold_samples(
     return int(sample_rate * (ms / 1000.0))
 
 
-# Skip-path only. RealtimeVad.accept_audio must not use this to invent speech_ended.
+# Used for fresh onset and bounded endpoint assistance, never to invent VAD speech_ended.
 ENERGY_ONSET_RMS = 0.01
 ENERGY_ONSET_MS = 200
 
@@ -62,6 +62,16 @@ def advance_energy_run(run_samples: int, pcm: np.ndarray, *, threshold: float = 
 
 def energy_onset_ready(run_samples: int, sample_rate: int, onset_ms: int = ENERGY_ONSET_MS) -> bool:
     return int(run_samples) >= int(sample_rate * (onset_ms / 1000.0))
+
+
+def endpoint_energy_wait(run_samples: int, waited_samples: int, cap_samples: int, sample_rate: int) -> bool:
+    """Give a late energy candidate at most 200ms beyond the endpoint cap.
+
+    Continuous energy is confirmed separately by energy_onset_ready; a single
+    spike cannot reset the deadline, and silence ends the extension immediately.
+    """
+    extra = int(sample_rate * ENERGY_ONSET_MS / 1000.0)
+    return run_samples > 0 and waited_samples < cap_samples + extra
 
 
 class RealtimeVad:

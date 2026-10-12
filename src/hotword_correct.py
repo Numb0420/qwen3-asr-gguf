@@ -1,15 +1,15 @@
 """Optional phoneme-based hotword correction after ITN, before emit / JSON.
 
 Mirrors `src/itn.py`: takes (text, words), returns corrected (text, words).
-Timestamps are re-synced via `token_sync.sync_words_from_text`, which merges
-the time spans of replaced characters into the new characters.
+Each corrected hotword stays one token and inherits the time range of its
+matched original-text span.
 """
 from __future__ import annotations
 
 import config
 from backend.base import WordTimestamp
 from logger import log
-from token_sync import sync_words_from_text
+from token_sync import sync_words_from_replacements
 
 # Lazy singleton — importing `hotword` pulls in pypinyin + rapidfuzz, so we
 # defer it until the first ASR result actually needs correction.
@@ -89,4 +89,20 @@ def apply_hotword(
         parts = [f"{wrong} -> {right}({score:.2f})" for wrong, right, score in result.matches]
         log.info("Hotword applied | matches={}", " | ".join(parts))
 
-    return result.text, sync_words_from_text(items, result.text)
+    try:
+        replacements = [(m.start, m.end, m.hotword) for m in result.replacements or []]
+        cursor = 0
+        parts = []
+        for start, end, hotword in sorted(replacements):
+            if not (cursor <= start < end <= len(raw)):
+                raise ValueError("Invalid hotword replacement spans")
+            parts.extend([raw[cursor:start], hotword])
+            cursor = end
+        parts.append(raw[cursor:])
+        if "".join(parts) != result.text:
+            raise ValueError("Hotword replacement spans do not match corrected text")
+        synced = sync_words_from_replacements(items, raw, replacements)
+    except Exception as exc:
+        log.warning("Hotword timestamp sync failed | err={}", exc)
+        return raw, items
+    return result.text, synced

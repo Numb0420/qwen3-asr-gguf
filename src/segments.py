@@ -42,8 +42,9 @@ def _sentence_end_punct(text: str) -> str:
 
 def _flush(buf_text: str, chars: list[dict], index: int) -> dict:
     text = buf_text.strip()
-    start = chars[0]["start"] if chars else 0.0
-    end = chars[-1]["end"] if chars else start
+    content_chars = [char for char in chars if has_transcript_content(char["text"])]
+    start = content_chars[0]["start"] if content_chars else 0.0
+    end = content_chars[-1]["end"] if content_chars else start
     return {
         "index": index,
         "start": start,
@@ -68,6 +69,15 @@ def words_to_segments(words: list[WordTimestamp] | None, fallback_text: str = ""
     chars: list[dict] = []
     index = 1
 
+    def _append_punctuation(token: str, fallback_time: float) -> None:
+        # Punctuation is not spoken: anchor each mark to the preceding text end.
+        anchor = chars[-1]["end"] if chars else (
+            segments[-1]["end"] if segments else fallback_time
+        )
+        for mark in token:
+            if not mark.isspace():
+                chars.append({"text": mark, "start": anchor, "end": anchor})
+
     def _commit() -> None:
         nonlocal buf_text, chars, index
         # Repeated sentence-end tokens must not create a timestamp-less segment.
@@ -79,10 +89,10 @@ def words_to_segments(words: list[WordTimestamp] | None, fallback_text: str = ""
 
     for item in items:
         token = item.word or ""
-        zero_dur = float(item.start) == float(item.end)
         # 0-duration gap items from the aligner (punctuation / spaces) and punct-only tokens.
-        if _is_punct_token(token) or (zero_dur and any(ch in _SENT_END for ch in token)):
+        if _is_punct_token(token):
             buf_text += token
+            _append_punctuation(token, item.start)
             if any(ch in _SENT_END for ch in token):
                 _commit()
             continue
@@ -93,6 +103,7 @@ def words_to_segments(words: list[WordTimestamp] | None, fallback_text: str = ""
             buf_text += word_part
         if punct_part:
             buf_text += punct_part
+            _append_punctuation(punct_part, item.end)
             if any(ch in _SENT_END for ch in punct_part):
                 _commit()
 

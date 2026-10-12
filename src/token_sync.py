@@ -2,13 +2,90 @@
 
 Adapted from CapsWriter-Offline core/tools/token_sync.py (MIT, Haujet Zhao):
 expand multi-char tokens, SequenceMatcher against the formatted string, then
-merge ASCII alnum runs. This project keeps start/end instead of a single stamp.
+merge ASCII alnum runs and complete numbers. This project keeps start/end
+instead of a single stamp.
 """
 from __future__ import annotations
 
 import difflib
+import re
 
 from backend.base import WordTimestamp
+
+_NUMBER = re.compile(r"(?<![A-Za-z0-9])[+-]?[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?(?![A-Za-z0-9])")
+
+
+def sync_words_from_replacements(
+    words: list[WordTimestamp] | None,
+    original_text: str,
+    replacements: list[tuple[int, int, str]],
+) -> list[WordTimestamp]:
+    """Map explicit original-text spans to whole replacement tokens."""
+    items = list(words or [])
+    if not items:
+        return []
+    # Stitching may leave punctuation differences between text and tokens.
+    if "".join(w.word or "" for w in items) != original_text:
+        items = sync_words_from_text(items, original_text)
+    ranges = []
+    offset = 0
+    for word in items:
+        stop = offset + len(word.word or "")
+        ranges.append((offset, stop, word))
+        offset = stop
+    if offset != len(original_text):
+        raise ValueError("Original text does not match timestamp tokens")
+
+    def slice_words(start: int, end: int) -> list[WordTimestamp]:
+        sliced = []
+        for left, right, word in ranges:
+            if left < end and right > start:
+                text = word.word[max(start, left) - left:min(end, right) - left]
+                sliced.append(WordTimestamp(text, word.start, word.end))
+        return sliced
+
+    output = []
+    cursor = 0
+    for start, end, text in sorted(replacements):
+        if not (cursor <= start < end <= len(original_text)):
+            raise ValueError("Invalid or overlapping hotword replacement spans")
+        output.extend(slice_words(cursor, start))
+        source = slice_words(start, end)
+        if not source:
+            raise ValueError("Hotword replacement has no source timestamps")
+        output.append(WordTimestamp(text, min(w.start for w in source),
+                                    max(w.end for w in source)))
+        cursor = end
+    output.extend(slice_words(cursor, len(original_text)))
+    return output
+
+
+def _merge_number_words(words: list[WordTimestamp]) -> list[WordTimestamp]:
+    """Keep a formatted number together, using the union of its source times."""
+    text = "".join(w.word or "" for w in words)
+    boundaries = {0: 0}
+    offset = 0
+    for i, word in enumerate(words):
+        offset += len(word.word or "")
+        boundaries[offset] = i + 1
+    merged: list[WordTimestamp] = []
+    cursor = 0
+    for match in _NUMBER.finditer(text):
+        # Do not split an existing token (e.g. an identifier or a unit).
+        if match.start() not in boundaries or match.end() not in boundaries:
+            continue
+        first, last = boundaries[match.start()], boundaries[match.end()]
+        if first >= last:
+            continue
+        merged.extend(words[cursor:first])
+        source = words[first:last]
+        merged.append(WordTimestamp(
+            word=match.group(), start=min(w.start for w in source),
+            end=max(w.end for w in source),
+        ))
+        cursor = last
+    merged.extend(words[cursor:])
+    return merged
 
 
 def sync_words_from_text(
@@ -19,14 +96,16 @@ def sync_words_from_text(
     if not items:
         return items
     raw = "".join(w.word or "" for w in items)
-    if not formatted_text or formatted_text == raw:
+    if not formatted_text:
         return items
+    if formatted_text == raw:
+        return _merge_number_words(items)
 
     need_merge = any(len(w.word or "") > 1 for w in items)
     work = _expand_words(items) if need_merge else items
     work_text = "".join(w.word or "" for w in work)
     if formatted_text == work_text:
-        return items
+        return _merge_number_words(items)
 
     char_to_tok: list[int] = []
     for idx, token in enumerate(work):
@@ -48,7 +127,7 @@ def sync_words_from_text(
 
     if need_merge:
         new_words = _merge_ascii_words(new_words)
-    return new_words
+    return _merge_number_words(new_words)
 
 
 def _expand_words(words: list[WordTimestamp]) -> list[WordTimestamp]:

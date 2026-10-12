@@ -47,3 +47,5 @@ INT4
 
 OpenClaw
 Agent
+继远
+恒卓

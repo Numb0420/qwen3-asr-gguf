@@ -100,6 +100,9 @@ FILE_CHUNK_SIZE_SEC = _safe_float("FILE_CHUNK_SIZE_SEC", "40")
 # Realtime encoder window. false = one growing-buffer chunk.
 # true = fixed REALTIME_CHUNK_SIZE_SEC slices. Needed for shared-utt reuse.
 WS_FIXED_ENCODER_WINDOW = _safe_bool("WS_FIXED_ENCODER_WINDOW", "false")
+# Finals encode the complete utterance; partials keep their fixed windows.
+WS_FINAL_WHOLE_UTTERANCE = _safe_bool("WS_FINAL_WHOLE_UTTERANCE", "true")
+WS_VAD_END_ENERGY_GUARD = _safe_bool("WS_VAD_END_ENERGY_GUARD", "true")
 # Shared utterance state. Off keeps the 4s sliding partial path.
 WS_SHARED_UTT = _safe_bool("WS_SHARED_UTT", "false")
 # Snapshot the latest partial when the worker is free. Off submits immediately.

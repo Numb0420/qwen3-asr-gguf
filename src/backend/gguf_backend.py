@@ -4,6 +4,7 @@ import gc
 import os
 import sys
 import threading
+import time
 import numpy as np
 from scipy.signal import resample_poly
 
@@ -29,6 +30,7 @@ from config import (
     WS_FINAL_ALIGN,
     WS_FINAL_YIELD,
     WS_FIXED_ENCODER_WINDOW,
+    WS_FINAL_WHOLE_UTTERANCE,
     WS_SHARED_UTT,
     TARGET_SR,
     VENDOR_DIR,
@@ -370,8 +372,9 @@ class QwenGGUFBackend(ASRBackend):
         wav = np.asarray(audio).reshape(-1)
         sr = int(sample_rate or TARGET_SR)
         duration = float(wav.size) / float(sr) if wav.size and sr else 0.0
+        whole_final = is_final and WS_FINAL_WHOLE_UTTERANCE and duration > REALTIME_CHUNK_SIZE_SEC + 0.05
         origin_start = audio_start_sample if origin_start_sample is None else int(origin_start_sample)
-        if WS_SHARED_UTT and origin_audio is not None:
+        if WS_SHARED_UTT and origin_audio is not None and not whole_final:
             self.advance_encoder(origin_audio, sample_rate, session_id, utt_id, origin_start)
         if WS_FIXED_ENCODER_WINDOW:
             window = float(REALTIME_CHUNK_SIZE_SEC)
@@ -387,7 +390,7 @@ class QwenGGUFBackend(ASRBackend):
             if resume:
                 skip_before = int(resume.get("next_idx") or 0)
 
-        def _once(chunk_sec: float, prefix: str) -> ASRResult:
+        def _once(chunk_sec: float, prefix: str, *, whole: bool = False) -> ASRResult:
             return self._run(
                 audio,
                 sample_rate,
@@ -398,10 +401,35 @@ class QwenGGUFBackend(ASRBackend):
                 prefix_text=prefix,
                 temperature=WS_ASR_TEMPERATURE,
                 abort_event=abort_event,
-                encoder_cache=encoder_cache,
-                skip_decode_before=skip_before,
-                yield_event=yield_event if (WS_FINAL_YIELD and is_final) else None,
+                # Fixed-window embeddings/resume indices cannot represent a
+                # newly encoded whole utterance. Never mix the two layouts.
+                encoder_cache=None if whole else encoder_cache,
+                skip_decode_before=0 if whole else skip_before,
+                yield_event=yield_event if (WS_FINAL_YIELD and is_final and not whole) else None,
             )
+
+        if whole_final:
+            t_whole = time.perf_counter()
+            result = None
+            fallback_reason = "empty"
+            try:
+                result = _once(duration, "", whole=True)
+            except Exception as exc:
+                if abort_event is not None and abort_event.is_set():
+                    raise
+                fallback_reason = type(exc).__name__
+                log.warning("WS final_whole failed | utt={} duration={:.3f}s error={}", utt_id, duration, exc)
+            aborted = abort_event is not None and abort_event.is_set()
+            if result is not None and ((result.text or "").strip() or aborted):
+                self._utt_cache.set_resume(session_id, utt_id, None)
+                log.info("WS final_whole | utt={} duration={:.3f}s elapsed_ms={:.1f} text_len={} n_chunks={} aborted={}",
+                         utt_id, duration, (time.perf_counter() - t_whole) * 1000,
+                         len(result.text or ""), (result.perf or {}).get("n_chunks"), int(aborted))
+                return result
+            if aborted:
+                raise RuntimeError("Whole-utterance final aborted")
+            log.warning("WS final_whole_fallback | utt={} duration={:.3f}s reason={} elapsed_ms={:.1f}",
+                        utt_id, duration, fallback_reason, (time.perf_counter() - t_whole) * 1000)
 
         # Decoder text prefix after a finished sentence (e.g. "正确的方向。")
         # frequently yields immediate EOS. Continuity is the 1s PCM overlap.

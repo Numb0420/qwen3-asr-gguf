@@ -44,6 +44,8 @@ from config import (
     WS_FINAL_ALIGN,
     WS_FINAL_YIELD,
     WS_FIXED_ENCODER_WINDOW,
+    WS_FINAL_WHOLE_UTTERANCE,
+    WS_VAD_END_ENERGY_GUARD,
     WS_FLUSH_SILENCE_MS,
     WS_HARD_CUT_MIN_SILENCE_MS,
     WS_HARD_CUT_OVERLAP_SECONDS,
@@ -85,6 +87,7 @@ from vad import (
     advance_energy_run,
     choose_hard_cut_silence,
     energy_onset_ready,
+    endpoint_energy_wait,
     scan_silences,
     silence_threshold_samples,
 )
@@ -603,6 +606,8 @@ async def websocket_transcribe(websocket: WebSocket):
             "ws_final_align": WS_FINAL_ALIGN,
             "remove_fillers": ASR_REMOVE_FILLERS,
             "fixed_encoder_window": WS_FIXED_ENCODER_WINDOW,
+            "final_whole_utterance": WS_FINAL_WHOLE_UTTERANCE,
+            "vad_end_energy_guard": WS_VAD_END_ENERGY_GUARD,
             "shared_utt": WS_SHARED_UTT,
             "lazy_partial": WS_LAZY_PARTIAL,
             "final_yield": WS_FINAL_YIELD,
@@ -1595,14 +1600,23 @@ async def websocket_transcribe(websocket: WebSocket):
             event = vad.accept_audio(chunk) if use_vad else type("E", (), {"is_speech": True, "speech_ended": False})()
             stream_samples += int(chunk.size)
             endpoint_resumed = False
+            # Observe energy on every packet, including endpoint grace packets.
+            prev_energy_run = energy_run
+            energy_run = advance_energy_run(energy_run, chunk)
+            loud = energy_run > prev_energy_run
+            endpoint_energy = WS_VAD_END_ENERGY_GUARD and energy_onset_ready(energy_run, TARGET_SR)
 
-            if punct_defer and event.is_speech:
+            if punct_defer and (event.is_speech or endpoint_energy):
                 log.info(
-                    "WS vad_defer_resume | utt={} cursor={:.3f} waited={:.3f}s",
+                    "WS vad_defer_resume | utt={} cursor={:.3f} waited={:.3f}s source={}",
                     utt_id,
                     _stream_cursor(),
                     punct_defer_silence / TARGET_SR,
+                    "vad" if event.is_speech else "energy",
                 )
+                if not event.is_speech:
+                    energy_hold = True
+                    energy_silence = 0
                 endpoint_resumed = True
                 punct_defer = False
                 punct_defer_silence = 0
@@ -1614,10 +1628,15 @@ async def websocket_transcribe(websocket: WebSocket):
                 # 说话人在等待期间说的话（如"能没这个"）会被丢弃。
                 speech_buf = np.concatenate([speech_buf, chunk]) if speech_buf.size else chunk.copy()
                 guess = last_partial_vad_by_utt.get(utt_id, "")
-                if punct_defer_silence >= punct_defer_cap:
+                at_limit = fresh_audio_samples(speech_buf.size, buffer_audio_start, commit_start, TARGET_SR) >= max_samples
+                energy_wait = WS_VAD_END_ENERGY_GUARD and endpoint_energy_wait(
+                    energy_run, punct_defer_silence, punct_defer_cap, TARGET_SR,
+                )
+                if at_limit or (punct_defer_silence >= punct_defer_cap and not energy_wait):
                     log.info(
-                        "WS vad_end | reason=resume_grace_timeout utt={} cursor={:.3f} "
+                        "WS vad_end | reason={} utt={} cursor={:.3f} "
                         "buf={:.3f}s extra_silence={:.3f}s sentence_end={} partial={}",
+                        "max_utterance" if at_limit else "resume_grace_timeout",
                         utt_id,
                         _stream_cursor(),
                         speech_buf.size / TARGET_SR if speech_buf.size else 0.0,
@@ -1627,12 +1646,12 @@ async def websocket_transcribe(websocket: WebSocket):
                     )
                     punct_defer = False
                     punct_defer_silence = 0
-                    await emit_asr(True, reason="vad_end")
+                    await emit_asr(True, reason="hard_cut" if at_limit else "vad_end")
+                elif punct_defer_silence >= punct_defer_cap:
+                    log.info("WS vad_energy_candidate | utt={} waited={:.3f}s energy_run={:.3f}s", utt_id,
+                             punct_defer_silence / TARGET_SR, energy_run / TARGET_SR)
                 continue
 
-            prev_energy_run = energy_run
-            energy_run = advance_energy_run(energy_run, chunk)
-            loud = energy_run > prev_energy_run
             energy_open = (
                 use_vad
                 and not event.is_speech

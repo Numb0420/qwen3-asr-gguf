@@ -47,6 +47,44 @@ def task_methods():
 
 
 class RescueTests(unittest.IsolatedAsyncioTestCase):
+    def test_punctuation_chars_anchor_to_previous_content(self):
+        words = [WordTimestamp("陕西的", 98.016, 98.576),
+                 WordTimestamp("，", 99.456, 99.456),
+                 WordTimestamp("陕西", 99.456, 99.696),
+                 WordTimestamp("56", 102.816, 103.376),
+                 WordTimestamp(".", 102.816, 103.376),
+                 WordTimestamp("5", 102.816, 103.376),
+                 WordTimestamp("嘛", 103.536, 103.616),
+                 WordTimestamp("？", 104.0, 104.0)]
+        segment = words_to_segments(words)[0]
+        self.assertEqual("".join(c["text"] for c in segment["chars"]), segment["text"])
+        punctuation = [c for c in segment["chars"] if c["text"] in "，.？"]
+        self.assertEqual(punctuation, [
+            {"text": "，", "start": 98.576, "end": 98.576},
+            {"text": ".", "start": 103.376, "end": 103.376},
+            {"text": "？", "start": 103.616, "end": 103.616},
+        ])
+        self.assertEqual((segment["start"], segment["end"]), (98.016, 103.616))
+
+    def test_attached_punctuation_keeps_zero_duration_content(self):
+        segment = words_to_segments([WordTimestamp("对！？", 10.0, 10.0)])[0]
+        self.assertEqual(segment["text"], "对！？")
+        self.assertEqual(segment["chars"], [
+            {"text": mark, "start": 10.0, "end": 10.0} for mark in "对！？"
+        ])
+
+    def test_punctuation_survives_filler_cleanup(self):
+        from fillers import clean_filler_segments
+        segments = words_to_segments([WordTimestamp("嗯", 1.0, 1.2),
+                                      WordTimestamp("，", 1.2, 1.2),
+                                      WordTimestamp("对。", 2.0, 2.3)])
+        cleaned = clean_filler_segments(segments)[0]
+        self.assertEqual(cleaned["text"], "对。")
+        self.assertEqual(cleaned["chars"], [
+            {"text": "对", "start": 2.0, "end": 2.3},
+            {"text": "。", "start": 2.3, "end": 2.3},
+        ])
+
     def test_punctuation_only_rescue_is_empty(self):
         dedup = task_methods()["_dedup_rescue_overlap"]
         words = [WordTimestamp("正文", 29.0, 29.2), WordTimestamp("。", 29.6, 29.6)]

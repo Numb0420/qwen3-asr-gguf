@@ -33,6 +33,7 @@ class CorrectionResult(NamedTuple):
     text: str                           # 纠错后的文本
     matches: List[Tuple[str, str, float]]  # [(原词, 热词, 分数), ...]
     similars: List[Tuple[str, str, float]]  # [(原词, 热词, 分数), ...]
+    replacements: Optional[List[MatchResult]] = None  # 实际替换区间，位置基于原文
     
 
 
@@ -211,7 +212,7 @@ class PhonemeCorrector:
                 return True
         return False
 
-    def _resolve_and_replace(self, text: str, matches: List[MatchResult], window: int) -> Tuple[str, List[Tuple[str, float]], List[Tuple[str, float]]]:
+    def _resolve_and_replace(self, text: str, matches: List[MatchResult], window: int) -> Tuple[str, List[Tuple[str, str, float]], List[Tuple[str, float]], List[MatchResult]]:
         """冲突去重与文本替换"""
         # 分数优先 > 长度优先
         matches.sort(key=lambda x: (x.score, x.end - x.start), reverse=True)
@@ -253,7 +254,7 @@ class PhonemeCorrector:
         for m in final_matches:
             result_list[m.start : m.end] = list(m.hotword)
             
-        return "".join(result_list), [(text[m.start:m.end], m.hotword, m.score) for m in final_matches], all_matched_info
+        return "".join(result_list), [(text[m.start:m.end], m.hotword, m.score) for m in final_matches], all_matched_info, final_matches
 
     def correct(self, text: str, k: int = 10, blacklist_window: int = 5) -> CorrectionResult:
         """
@@ -291,10 +292,10 @@ class PhonemeCorrector:
             matches, similars = self._find_matches(text, fast_results, input_processed)
 
         # 3. 冲突解决与替换
-        new_text, final_hw_info, all_hw_info = self._resolve_and_replace(text, matches, window)
+        new_text, final_hw_info, all_hw_info, replacements = self._resolve_and_replace(text, matches, window)
         
         # similars 已经是 [(origin, hw, score), ...] 的元组列表
-        return CorrectionResult(text=new_text, matches=final_hw_info, similars=similars[:k])
+        return CorrectionResult(text=new_text, matches=final_hw_info, similars=similars[:k], replacements=replacements)
 
 
 if __name__ == "__main__":
