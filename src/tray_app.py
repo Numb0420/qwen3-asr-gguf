@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -60,8 +61,16 @@ class TrayService:
         self.root = _pack_root()
         env = _load_env_file(self.root / ".env")
         self.host = env.get("HOST", "127.0.0.1")
+        if self.host in ("0.0.0.0", "::"):
+            self.host = "127.0.0.1"
         self.port = int(env.get("PORT", "8765") or "8765")
         self.base = f"http://{self.host}:{self.port}"
+        # Control uses local HTTP only. build_opener also initializes HTTPS,
+        # which can fail in a frozen exe when system CA paths are unavailable.
+        self._http = urllib.request.OpenerDirector()
+        self._http.add_handler(urllib.request.HTTPHandler())
+        self._http.add_handler(urllib.request.HTTPDefaultErrorHandler())
+        self._http.add_handler(urllib.request.HTTPErrorProcessor())
         self.proc: subprocess.Popen | None = None
         self._log_fp = None
         self._lock = threading.Lock()
@@ -72,6 +81,7 @@ class TrayService:
         self._icon = None
         self._stop_poll = threading.Event()
         self._kill_service_on_exit = False
+        self._starting = False
 
     def service_cmd(self) -> list[str] | None:
         runtime = self.root / "runtime" / "python.exe"
@@ -80,7 +90,36 @@ class TrayService:
             return [str(runtime), str(script)]
         repo_run = self.root / "run.py"
         if repo_run.is_file():
-            return [sys.executable, str(repo_run)]
+            env = _load_env_file(self.root / ".env")
+            configured = os.environ.get("ASR_PYTHON") or env.get("ASR_PYTHON")
+            candidates = [configured] if configured else []
+            candidates += [str(self.root / ".venv/Scripts/python.exe"),
+                           str(self.root / "runtime/python.exe"),
+                           r"D:\anaconda3\envs\lingting\python.exe",
+                           r"C:\ProgramData\miniconda3\envs\lingting\python.exe",
+                           str(Path.home() / "miniconda3/envs/lingting/python.exe"),
+                           str(Path.home() / ".conda/envs/lingting/python.exe")]
+            registered = Path.home() / ".conda/environments.txt"
+            if registered.is_file():
+                candidates += [str(Path(p.strip()) / "python.exe")
+                               for p in registered.read_text(encoding="utf-8").splitlines()
+                               if p.strip() and Path(p.strip()).name == "lingting"]
+            if not getattr(sys, "frozen", False):
+                candidates.append(sys.executable)
+            candidates.append(shutil.which("python"))
+            for candidate in candidates:
+                if not candidate or not Path(candidate).is_file():
+                    continue
+                if getattr(sys, "frozen", False) and Path(candidate).resolve() == Path(sys.executable).resolve():
+                    continue
+                try:
+                    check = subprocess.run([candidate, "-c", "import uvicorn"],
+                                           capture_output=True, timeout=10,
+                                           creationflags=CREATE_NO_WINDOW)
+                    if check.returncode == 0:
+                        return [candidate, str(repo_run)]
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
         return None
 
     def logs_dir(self) -> Path:
@@ -100,11 +139,12 @@ class TrayService:
             headers={"Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._http.open(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
                 return json.loads(body) if body else {}
         except Exception as exc:
-            self._last_error = str(exc)
+            if path != "/health":
+                self._last_error = str(exc)
             return None
 
     def health(self):
@@ -122,13 +162,15 @@ class TrayService:
 
     def start(self) -> str:
         with self._lock:
+            if self._stop_poll.is_set():
+                return "stopped"
             if self.proc is not None and self.proc.poll() is None:
                 return "already"
             if self.health() is not None:
                 return "already"
             cmd = self.service_cmd()
             if not cmd:
-                self._last_error = "runtime/python.exe or app/run.py not found"
+                self._last_error = "未找到服务环境，请在 .env 设置 ASR_PYTHON"
                 return "error"
             log_dir = self.logs_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -157,9 +199,13 @@ class TrayService:
             except Exception as exc:
                 self._last_error = str(exc)
                 return "error"
+            self._last_error = ""
         deadline = time.time() + _START_WAIT_S
         while time.time() < deadline:
+            if self._stop_poll.is_set():
+                return "stopped"
             if self.health() is not None:
+                self._last_error = ""
                 self._crash_streak = 0
                 self.warmup_async()
                 return "ok"
@@ -260,6 +306,8 @@ class TrayService:
             lnk.unlink()
 
     def status_label(self) -> str:
+        if self._starting:
+            return "正在启动服务"
         data = self.health()
         if data is None:
             if self._last_error:
@@ -407,15 +455,20 @@ class TrayService:
                 checked=lambda _: self.autostart_enabled(),
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出托盘（服务继续运行）", self.on_exit_tray),
-            pystray.MenuItem("退出并停止服务", self.on_exit_all, default=True),
+            pystray.MenuItem("退出", self.on_exit_all),
         )
 
     def run(self) -> int:
         if not try_acquire(TRAY_MUTEX):
             return 0
         self.repair_autostart_if_needed()
-        self.start()
+        def start_background():
+            self._starting = True
+            try:
+                self.start()
+            finally:
+                self._starting = False
+        threading.Thread(target=start_background, daemon=True).start()
         threading.Thread(target=self.poll_loop, daemon=True).start()
         icon = pystray.Icon(
             "ASR",
@@ -427,6 +480,8 @@ class TrayService:
         icon.run()
         if self._kill_service_on_exit:
             self.stop()
+        if self._log_fp:
+            self._log_fp.close()
         os._exit(0)
 
 
